@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="autotools-build" type="MAKEFILE_TARGET_RUN_CONFIGURATION" factoryName="Makefile">
+    <makefile filename="$PROJECT_DIR$/../build-codes/Makefile" target="install" workingDirectory="$PROJECT_DIR$/../build-codes" arguments="">
+      <envs />
+    </makefile>
+    <method v="2">
+      <option name="ToolBeforeRunTask" enabled="true" actionId="Tool_External Tools_prepare" />
+      <option name="ToolBeforeRunTask" enabled="true" actionId="Tool_External Tools_configure" />
+    </method>
+  </configuration>
+</component>
