@@ -534,19 +534,21 @@ static tw_lp * codes_mapping_to_lp( tw_lpid lpid)
 void codes_mapping_setup_with_seed_offset(int offset)
 {
   int grp, lpt, message_size;
-  int pes = tw_nnodes();
+  int pes = tw_nnodes();  // The total number of PEs (MPI ranks)
 
+  /* First get the total number of LPs defined in lpconf, temporarily store it in lps_per_pe_floor */
   lps_per_pe_floor = 0;
   for (grp = 0; grp < lpconf.lpgroups_count; grp++)
    {
     for (lpt = 0; lpt < lpconf.lpgroups[grp].lptypes_count; lpt++)
 	lps_per_pe_floor += (lpconf.lpgroups[grp].lptypes[lpt].count * lpconf.lpgroups[grp].repetitions);
    }
-
+  /* Then calculate LPs per PE, and store it also in lps_per_pe_floor */
   tw_lpid global_nlps = lps_per_pe_floor;
   lps_leftover = lps_per_pe_floor % pes;
   lps_per_pe_floor /= pes;
  //printf("\n LPs for this PE are %d reps %d ", lps_per_pe_floor,  lpconf.lpgroups[grp].repetitions);
+  /* Configure ROSS */
   g_tw_mapping=CUSTOM;
   g_tw_custom_initial_mapping=&codes_mapping_init;
   g_tw_custom_lp_global_to_local_map=&codes_mapping_to_lp;

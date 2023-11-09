@@ -81,14 +81,13 @@ typedef struct config_lpgroups_s
 
 typedef struct ConfigVTable * ConfigHandle;
 
-/*
+/**
  * Load a configuration on the system (collectively)
- *
- * filepath - path and name of file
- * comm     - communicator to distribute file on
- * handle   - output of configuration
- *
- * return 0 on success
+ * and load "LPGROUPS" configuration defined in the file into the global variable lpconf
+ * @param filepath input: path and name of file
+ * @param comm     input: communicator to distribute file on
+ * @param handle   output: to which the configuration is loaded
+ * @return 0 on success
  */
 int configuration_load (const char * filepath,
                         MPI_Comm comm,

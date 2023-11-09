@@ -17,17 +17,20 @@
 #include "codes/configuration.h"
 #include "codes/lp-type-lookup.h"
 
-#define PAYLOAD_SZ 512
+#define PAYLOAD_SZ 1024
 
 #define PARAMS_LOG 1
+#define G_TW_END_OPT_OVERRIDE 1
 
-static int net_id = 0;
+
+static int net_id = 0;  /* Which type of network this is. E.g. FATTREE. Will be updated after the configuration is loaded*/
 static int offset = 2;
 static int traffic = 1;
 static double arrival_time = 1000.0;
 static double load = 0.0;	//Percent utilization of terminal uplink
 static double MEAN_INTERVAL = 0.0;
 char * modelnet_stats_dir;
+static int num_msgs = 20;
 /* whether to pull instead of push */
 
 static int num_servers_per_rep = 0;
@@ -91,6 +94,7 @@ struct svr_msg
     enum svr_event svr_event_type;
     tw_lpid src;          /* source of this request or ack */
     int incremented_flag; /* helper for reverse computation */
+    int completed_sends; /* helper for reverse computation */
     model_net_event_return event_rc;
 };
 
@@ -111,15 +115,16 @@ static void svr_finalize(
     svr_state * ns,
     tw_lp * lp);
 
+/* Server LP configuration with ROSS*/
 tw_lptype svr_lp = {
-    (init_f) svr_init,
+    (init_f) svr_init,  /* Initialisation function */
     (pre_run_f) NULL,
-    (event_f) svr_event,
-    (revent_f) svr_rev_event,
+    (event_f) svr_event,  /* Event handler function */
+    (revent_f) svr_rev_event,  /* Reverse event handler function */
     (commit_f) NULL,
-    (final_f)  svr_finalize,
-    (map_f) codes_mapping,
-    sizeof(svr_state),
+    (final_f)  svr_finalize,    /* Finalisation function */
+    (map_f) codes_mapping,    /* LP mapping function */
+    sizeof(svr_state),    /* The state (a struct) of the server */
 };
 
 /* setup for the ROSS event tracing
@@ -174,6 +179,7 @@ const tw_optdef app_opt [] =
 	TWOPT_UINT("traffic", traffic, "UNIFORM RANDOM=1, BISECTION=2 "),
 	TWOPT_STIME("arrival_time", arrival_time, "INTER-ARRIVAL TIME"),
         TWOPT_STIME("load", load, "percentage of terminal link bandiwdth to inject packets"),
+        TWOPT_UINT("num_messages", num_msgs, "Number of messages to be generated per terminal "),
         TWOPT_END()
 };
 
@@ -199,6 +205,15 @@ static void issue_event(
     /* each server sends a dummy event to itself that will kick off the real
      * simulation
      */
+
+    /*
+     * Configure:
+     *   - mean inter-arrival time: MEAN_INTERVAL. Can be loaded in two ways:
+     *      - by specifying arrival_time directly
+     *      - by calculating based on PARAMS:packet_size and PARAMS:link_bandwidth in the config file
+     *
+     */
+
 
     int this_packet_size = 0;
     double this_link_bandwidth = 0.0;
@@ -227,8 +242,8 @@ static void issue_event(
 
     /* skew each kickoff event slightly to help avoid event ties later on */
 //    kickoff_time = 1.1 * g_tw_lookahead + tw_rand_exponential(lp->rng, arrival_time);
-    kickoff_time = g_tw_lookahead + tw_rand_exponential(lp->rng, MEAN_INTERVAL);
-
+    //kickoff_time = g_tw_lookahead + tw_rand_exponential(lp->rng, MEAN_INTERVAL);
+    kickoff_time = MEAN_INTERVAL;
     e = tw_event_new(lp->gid, kickoff_time, lp);
     m = tw_event_data(e);
     m->svr_event_type = KICKOFF;
@@ -241,6 +256,7 @@ static void svr_init(
 {
     ns->start_ts = 0.0;
 
+    /* Issue a kickoff event */
     issue_event(ns, lp);
     return;
 }
@@ -253,6 +269,9 @@ static void handle_kickoff_rev_event(
 {
     (void)b;
     (void)m;
+    if(m->completed_sends) {
+        return;
+    }
 	ns->msg_sent_count--;
 	model_net_event_rc2(lp, &m->event_rc);
     tw_rand_reverse_unif(lp->rng);
@@ -265,10 +284,18 @@ static void handle_kickoff_event(
 {
     (void)b;
     (void)m;
+    if(ns->msg_sent_count >= num_msgs)
+    {
+        m->completed_sends = 1;
+        return;
+    }
+    m->completed_sends = 0;
+
 //    char* anno;
     char anno[MAX_NAME_LENGTH];
     tw_lpid local_dest = -1, global_dest = -1;
-   
+
+    /* Create two messages: local and remote */
     svr_msg * m_local = malloc(sizeof(svr_msg));
     svr_msg * m_remote = malloc(sizeof(svr_msg));
 
@@ -278,10 +305,13 @@ static void handle_kickoff_event(
     memcpy(m_remote, m_local, sizeof(svr_msg));
     m_remote->svr_event_type = REMOTE;
 
+    /* Update the node state: start time*/
     ns->start_ts = tw_now(lp);
 
    codes_mapping_get_lp_info(lp->gid, group_name, &group_index, lp_type_name, &lp_type_index, anno, &rep_id, &offset);
    int local_id = codes_mapping_get_lp_relative_id(lp->gid, 0, 0);
+
+   /* Determine the destination of the message */
    /* in case of uniform random traffic, send to a random destination. */
    if(traffic == UNIFORM)
    {
@@ -363,6 +393,12 @@ static void handle_local_event(
     ns->local_recvd_count++;
 }
 
+/* convert seconds to ns */
+static tw_stime s_to_ns(tw_stime ns)
+{
+    return(ns * (1000.0 * 1000.0 * 1000.0));
+}
+
 static void svr_finalize(
     svr_state * ns,
     tw_lp * lp)
@@ -397,6 +433,13 @@ static void svr_rev_event(
     }
 }
 
+/**
+ * Event handler
+ * @param ns
+ * @param b
+ * @param m
+ * @param lp
+ */
 static void svr_event(
     svr_state * ns,
     tw_bf * b,
@@ -471,6 +514,11 @@ int main(
     net_id = *net_ids;
     free(net_ids);
 
+    if(G_TW_END_OPT_OVERRIDE) {
+        /* 5 days of simulation time */
+        g_tw_ts_end = s_to_ns(5 * 24 * 60 * 60);
+    }
+
     if(net_id != FATTREE)
     {
 	printf("\n The test works with fat tree model configuration only! ");
@@ -489,12 +537,14 @@ int main(
 
     printf("num_nodes:%d \n",num_nodes);
 
-    if(lp_io_prepare("modelnet-test", LP_IO_UNIQ_SUFFIX, &handle, MPI_COMM_CODES) < 0)
+    /* Prepare the output directory */
+    if(lp_io_prepare("lpio/modelnet-test", LP_IO_UNIQ_SUFFIX, &handle, MPI_COMM_CODES) < 0)
     {
         return(-1);
     }
     modelnet_stats_dir = lp_io_handle_to_dir(handle);
 
+    /* run the simulation */
     tw_run();
 
     model_net_report_stats(net_id);

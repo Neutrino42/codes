@@ -75,13 +75,20 @@ static int codes_noop_bypass = 0;
 static int do_config_nets[MAX_NETS];
 
 void model_net_register(){
-    // first set up which networks need to be registered, then pass off to base
+    // first set up which networks (e.g. whether it is dragonfly, fat-tree, etc. or both)
+    // need to be registered, stored as an array of flags in do_config_nets[],
+    // then pass off to base (model_net_base_register())
     // LP to do its thing
+    /*
+     * Iterate over the config_lpgroup_t lpgroups[] in the config_lpgroups_t strcut named lpconf,
+     * and set the values in do_config_nets[].
+     * Notice the names of the two structs config_lpgroup_t and config_lpgroups_t are different!
+     */
     memset(do_config_nets, 0, MAX_NETS * sizeof(*do_config_nets));
     for (int grp = 0; grp < lpconf.lpgroups_count; grp++){
         config_lpgroup_t *lpgroup = &lpconf.lpgroups[grp];
         for (int lpt = 0; lpt < lpgroup->lptypes_count; lpt++){
-            char const *nm = lpgroup->lptypes[lpt].name.ptr;
+            char const *nm = lpgroup->lptypes[lpt].name.ptr;  // "nm" stands for "name"
             for (int n = 0; n < MAX_NETS; n++){
                 if (!do_config_nets[n] &&
                         strcmp(model_net_lp_config_names[n], nm) == 0){
@@ -158,7 +165,7 @@ int* model_net_configure(int *id_count){
 
     codes_cn_delay = 1/cn_bandwidth;
     if(!g_tw_mynode) {
-        printf("within node transfer per byte delay is %f\n", codes_cn_delay);
+        printf("within node transfer per byte delay is %f\n", codes_cn_delay);  ////// ????? Byte? not bit?
     }
 
     ret = configuration_get_value_int(&config, "PARAMS", "node_eager_limit", NULL,

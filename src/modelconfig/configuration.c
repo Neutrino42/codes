@@ -37,6 +37,9 @@ int configuration_load (const char *filepath,
     int        rc = 0;
     char      *tmp_path = NULL;
 
+    /*
+     * Open file at `filepath`, then load the content into `textdata`.
+     */
     rc = MPI_File_open(comm, (char*)filepath, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
     if (rc != MPI_SUCCESS) goto finalize;
 

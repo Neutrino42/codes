@@ -206,44 +206,47 @@ void model_net_event_collective_rc(
         int message_size,
         tw_lp *sender);
 
-/* allocate and transmit a new event that will pass through model_net to
- * arrive at its destination:
+/**
+ * allocate and transmit a new event that will pass through model_net to
+ * arrive at its destination.
+ * The modelnet LP used for communication is determined by the default CODES
+ * map context (see codes-base, codes/codes-mapping-context.h), using net_id
+ * to differentiate different model types. Note that the map context is used
+ * when calculating *both* sender and receiver modelnet LPs.
  *
- * - net_id: the type of network to send this message through. The set of
+ * @param net_id the type of network to send this message through. The set of
  *   net_id's is given by model_net_configure.
- * - category: category name to associate with this communication
+ * @param category category name to associate with this communication
  *   - OPTIONAL: callers can set this to NULL if they don't want to use it,
  *     and model_net methods can ignore it if they don't support it
- * - final_dest_lp: the LP that the message should be delivered to.
+ * @param final_dest_lp the LP that the message should be delivered to.
  *   - NOTE: this is _not_ the LP of an underlying network method (for
  *     example, it is not a torus or dragonfly LP), but rather the LP of an
  *     MPI process or storage server that you are transmitting to.
- * - message_size: this is the size of the message (in bytes) that modelnet
+ * @param message_size this is the size of the message (in bytes) that modelnet
  *     will simulate transmitting to the final_dest_lp.  It can be any size
  *     (i.e. it is not constrained by transport packet size).
- * - remote_event_size: this is the size of the ROSS event structure that
+ * @param offset
+ * @param remote_event_size this is the size of the ROSS event structure that
  *     will be delivered to the final_dest_lp.
- * - remote_event: pointer to data to be used as the remote event message. When
+ * @param remote_event pointer to data to be used as the remote event message. When
  *   the message payload (of size message_size) has been fully delivered to the
  *   destination (given by final_dest_lp), this event will be issued.
- * - self_event_size: this is the size of the ROSS event structure that will
+ * @param self_event_size this is the size of the ROSS event structure that will
  *     be delivered to the calling LP once local completion has occurred for
  *     the network transmission.
  *     - NOTE: "local completion" in this sense means that model_net has
  *       transmitted the data off of the local node, but it does not mean that
  *       the data has been (or even will be) delivered.  Once this event is
  *       delivered the caller is free to re-use its buffer.
- * - self_event: pointer to data to be used as the self event message. When the
+ * @param self_event pointer to data to be used as the self event message. When the
  *   message payload (of size message_size) has been fully sent from the
  *   sender's point of view (e.g. the corresponding NIC has sent out all
  *   packets for this message), the event will be issued to the sender.
- * - sender: pointer to the tw_lp structure of the API caller.  This is
+ * @param sender pointer to the tw_lp structure of the API caller.  This is
  *     identical to the sender argument to tw_event_new().
+ * @return ?
  *
- * The modelnet LP used for communication is determined by the default CODES
- * map context (see codes-base, codes/codes-mapping-context.h), using net_id
- * to differentiate different model types. Note that the map context is used
- * when calculating *both* sender and receiver modelnet LPs
  */
 // first argument becomes the network ID
 model_net_event_return model_net_event(

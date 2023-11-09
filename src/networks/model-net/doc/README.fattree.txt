@@ -9,7 +9,7 @@ MODELNET_GRP
 {
 	repetitions="12";
 	nw-lp="4";
-	modelnet_fattree="4";
+	modelnet_fattree="4";    # num of servers per leaf switch?
 	fattree_switch="3";
 } 
 PARAMS
