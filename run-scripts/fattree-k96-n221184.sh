@@ -4,7 +4,7 @@
 # name our experiment (this will specify the name of a directory where certain model output files will be created)
 EXP_NAME="fattree-test"
 # let's create some variable that we can set so that we can add some unique number and not overwrite saved stdout files
-count=0
+count=20
 
 
 
@@ -14,8 +14,8 @@ CODES_BUILD_LOC="$CODES_LOC/build"
 BIN="$CODES_BUILD_LOC/bin/model-net-synthetic-fattree"
 CONFIG="$CODES_LOC/run-scripts/conf/modelnet-synthetic-fattree-k96.conf"
 
-RANKS=40
-#HOSTFILE="$CODES_LOC/run-scripts/hostfile"
+RANKS=20
+HOSTFILE="$CODES_LOC/run-scripts/hostfile"
 TRAFFIC=1
 NUM_MESSAGES=160
 #PAYLOAD_SIZE=8192
@@ -41,5 +41,5 @@ LP_IO_DIR="$EXP_NAME-$count-$(date +%s)"
 # Default:
 # mpirun -np $RANKS $BIN --sync=3 --traffic=$TRAFFIC --num_messages=$NUM_MESSAGES --payload_sz=$PAYLOAD_SIZE --arrival_time=$ARRIVAL_TIME --lp-io-dir=$LP_IO_PARENT_DIR/$LP_IO_DIR --lp-io-use-suffix=1 -- $CONFIG | tee "$OUT_DIR/$LP_IO_DIR.txt"
 
-#mpirun --hostfile $HOSTFILE --mca btl_tcp_if_include eno2np1 -np $RANKS $BIN --sync=3 --load=$LOAD -- $CONFIG | tee "$OUT_DIR/$LP_IO_DIR.txt"
-mpirun -np $RANKS $BIN --sync=3 --load=$LOAD --num_messages=$NUM_MESSAGES -- $CONFIG | tee "$OUT_DIR/$LP_IO_DIR.txt"
+cat hostfile > "$OUT_DIR/$LP_IO_DIR.txt"
+mpirun --prefix /opt/openmpi-4.1.6 --mca btl ^openib --hostfile $HOSTFILE -np $RANKS $BIN --sync=3 --load=$LOAD --num_messages=$NUM_MESSAGES -- $CONFIG | tee -a "$OUT_DIR/$LP_IO_DIR.txt"
