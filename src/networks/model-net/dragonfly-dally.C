@@ -143,6 +143,7 @@ extern cortex_topology dragonfly_dally_cortex_topology;
 
 static long packet_gen = 0, packet_fin = 0;
 
+/* max(a,b)*/
 static double maxd(double a, double b) { return a < b ? b : a; }
 
 /* minimal and non-minimal packet counts for adaptive routing*/
@@ -446,10 +447,11 @@ struct terminal_state
 {
     uint64_t packet_counter;
 
-    int packet_gen;
-    int packet_fin;
-
-    int total_gen_size;
+    //TODO: optimise the usage of this variable
+    int packet_gen;  /* Total number of packets generated, but seems not used at the end !!*/ 
+    // TODO: optimise the usage of this variable
+    int packet_fin;  /* Total number of packets finished, but seems not used at the end !! */ 
+    int total_gen_size;  /* Total size of all packets generated, used for statisitcs purposes */
 
     // Dragonfly specific parameters
     tw_lpid* router_lp; //one per rail
@@ -464,15 +466,26 @@ struct terminal_state
 
     int workloads_finished_flag;
 
-    int** vc_occupancy; // vc_occupancies [rail_id][qos_level]
+    int** vc_occupancy; // [rail_id][qos_level] the current used buffer size (bytes) of each vc (for credit-based congestion control)
     tw_stime* terminal_available_time; // [rail_id]
-    terminal_dally_message_list ***terminal_msgs; //[rail_id][qos_level]
+
+    /* The CODES/ROSS message list of the terminal */
+    // [rail_id][qos_level].
+    // terminal_msgs[0][0] points to the head of the msg linked list in rail 0 qos_level 0
+    terminal_dally_message_list ***terminal_msgs;
     terminal_dally_message_list ***terminal_msgs_tail; //[rail_id][qos_level]
+
+    /* [rail_id]: 0 for available, 1 for occupied.
+    * A T_SEND event is scheduled only if in_send_loop is 0, then set in_send_loop to 1 
+    * After finishing processing a T_SEND event, in_send_loop is set to 0.  
+    * - used to prevent multiple sends from the same rail.
+    */ 
     int* in_send_loop; // [rail_id]
     struct mn_stats dragonfly_stats_array[CATEGORY_MAX];
 
-    int ** qos_status; //[rail_id][qos_level]
-    int ** qos_data; //[rail_id][qos_level]
+    /* QoS */
+    int ** qos_status; //[rail_id][qos_level]: 1 if active, 2 if overbw
+    int ** qos_data; //[rail_id][qos_level] 
 
     int* last_qos_lvl; //[rail_id]
     int is_monitoring_bw;
@@ -480,7 +493,7 @@ struct terminal_state
     struct rc_stack * st;
     struct rc_stack * cc_st;
     int* issueIdle; //[rail_id]
-    int** terminal_length; // [rail_id][qos_level]
+    int** terminal_length; // [rail_id][qos_level], total size of all packets in that rail and that qos level.
 
     const char * anno;
     const dragonfly_param *params;
@@ -488,6 +501,11 @@ struct terminal_state
     struct qhash_table *rank_tbl;
     uint64_t rank_tbl_pop;
 
+    /* 
+    * ===============
+    *   Statistics
+    * ===============
+    */
     tw_stime   total_time;
     uint64_t total_msg_size;
     double total_hops;
@@ -508,8 +526,8 @@ struct terminal_state
     tw_stime max_latency;
     tw_stime min_latency;
 
-    char output_buf[4096];
-    char output_buf2[4096];
+    char output_buf[4096];  /* used at the end of the simulation for storing statistics */
+    char output_buf2[4096];  /* used at the end of the simulation for storing statistics */
 
     /* For sampling */
     long fin_chunks_sample;
@@ -1173,6 +1191,7 @@ static int dragonfly_hash_func(void *k, int table_size)
 }
 
 /* convert GiB/s and bytes to ns */
+/* How many ns it will take to put all the specified bytes onto the link of the specified speed */
 static tw_stime bytes_to_ns(uint64_t bytes, double GB_p_s)
 {
     tw_stime time;
@@ -1449,6 +1468,13 @@ static Connection dfdally_get_best_from_k_connections(router_state *s, tw_bf *bf
     return get_absolute_best_connection_from_conns(s, bf, msg, lp, k_conns);
 }
 
+/**
+ * Simply append msg to the end of list[index]
+ * @param thisq Head of the 2-D list
+ * @param thistail Tail of the 2-D list
+ * @param index
+ * @param msg
+ */
 static void append_to_terminal_dally_message_list(  
         terminal_dally_message_list ** thisq,
         terminal_dally_message_list ** thistail,
@@ -1483,7 +1509,7 @@ static void prepend_to_terminal_dally_message_list(
     } 
     thisq[index] = msg;
 }
-
+// Get the head of the list and remove it from the list
 static terminal_dally_message_list* return_head(
         terminal_dally_message_list ** thisq,
         terminal_dally_message_list ** thistail,
@@ -2278,6 +2304,12 @@ static void dragonfly_dally_router_congestion_event_commit(router_state *s, tw_b
     cc_router_local_congestion_event_commit(s->local_congestion_controller, bf, msg, lp);
 }
 
+/**
+ * Retrieves the VCG (Virtual Channel Group) from msg->category.
+ *
+ * @param msg The terminal_dally_message object containing the message.
+ * @return The VCG (QoS level) associated with the specified category.
+ */
 int get_vcg_from_category(terminal_dally_message * msg)
 {
    if(strcmp(msg->category, "high") == 0)
@@ -2485,6 +2517,18 @@ void issue_rtr_bw_monitor_event(router_state *s, tw_bf *bf, terminal_dally_messa
     }
 }
 
+/**
+ * @brief Determines the next virtual channel group (vcg) to be used for sending a message.
+ * 
+ * This function calculates the next vcg based on the current state of the terminal and the message being sent.
+ * It takes into account the number of qos levels, bandwidth consumption, and vcg occupancy.
+ * 
+ * @param s Pointer to the terminal state.
+ * @param bf Pointer to the bitfield used for communication between LPs.
+ * @param msg Pointer to the terminal dally message being sent.
+ * @param lp Pointer to the LP (logical process) executing the function.
+ * @return The index of the next vcg to be used, or -1 if no vcg is available.
+ */
 static int get_next_vcg(terminal_state * s, tw_bf * bf, terminal_dally_message * msg, tw_lp * lp)
 {
     int num_qos_levels = s->params->num_qos_levels;
@@ -2499,13 +2543,19 @@ static int get_next_vcg(terminal_state * s, tw_bf * bf, terminal_dally_message *
 
     int bw_consumption[num_qos_levels];
 
-    /* First make sure the bandwidth consumptions are up to date. */
+    /* First make sure the bandwidth consumptions are up-to-date. */
+    /* Check the bandwidth consumption for the traffic of each qos level 
+    * and mark the qos level as "over bandwidth" if it exceeds the specified bandwidth.
+    */
     for(int k = 0; k < num_qos_levels; k++)
     {
         if(s->qos_status[msg->rail_id][k] != Q_OVERBW)
         {
             bw_consumption[k] = get_term_bandwidth_consumption(s, msg->rail_id, k);
-            if(bw_consumption[k] > s->params->qos_bandwidths[k]) 
+            if(bw_consumption[k] > s->params->qos_bandwidths[k])  
+            /* If the current throughput of a specifc qos type exceeds the specified bandwidth
+            * then mark it as "over bandwidth" Q_OVERBW.
+            */
             {
                 if(k == 0)
                     msg->qos_reset1 = 1;
@@ -2518,6 +2568,7 @@ static int get_next_vcg(terminal_state * s, tw_bf * bf, terminal_dally_message *
     }
     /* TODO: If none of the vcg is exceeding bandwidth limit then select high
     * priority traffic first. */
+   /* Among the vcgs that are not exceeding bandwidth limit, select the highest priority traffic first */
     if(BW_MONITOR == 1)
     {
         for(int i = 0; i < num_qos_levels; i++)
@@ -2532,7 +2583,7 @@ static int get_next_vcg(terminal_state * s, tw_bf * bf, terminal_dally_message *
 
 
     int next_rr_vcg = (s->last_qos_lvl[msg->rail_id] + 1) % num_qos_levels;
-    /* All vcgs are exceeding their bandwidth limits*/
+    /* If all vcgs are exceeding their bandwidth limits*/
     for(int i = 0; i < num_qos_levels; i++)
     {
         if(s->terminal_msgs[msg->rail_id][i] != NULL && s->vc_occupancy[msg->rail_id][i] + s->params->chunk_size <= s->params->cn_vc_size)
@@ -3181,7 +3232,7 @@ static tw_stime dragonfly_dally_packet_event(
             memcpy(tmp_ptr, self_event, req->self_event_size);
             tmp_ptr += req->self_event_size;
         }
-     }
+    }
 	   //printf("\n dragonfly remote event %d local event %d last packet %d %lf ", msg->remote_event_size_bytes, msg->local_event_size_bytes, is_last_pckt, xfer_to_nic_time);
     tw_event_send(e_new);
     return xfer_to_nic_time;
@@ -3255,9 +3306,14 @@ static void packet_generate_rc(terminal_state * s, tw_bf * bf, terminal_dally_me
 }
 
 /* generates packet at the current dragonfly compute node */
+/*
+ * Get the QoS level from msg; determine the rail id.
+ * Then split the packet in smaller chunks and put them in s->terminal_msg[rail][QoS]
+ * Finally issue a T_SEND event to the terminal (myself)
+ */
 static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_message * msg, tw_lp * lp) {
+    /* Update statistics */
     packet_gen++;
-
     s->packet_gen++;
     s->total_gen_size += msg->packet_size;
 
@@ -3267,13 +3323,14 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
     const dragonfly_param *p = s->params;
 
     int total_event_size;
+    /* Calculate number of chunks */
+    // TODO: there seems to be a problem in the calculation!!!
     uint64_t num_chunks = msg->packet_size / p->chunk_size;
-    
-    double cn_delay = s->params->cn_delay;
-
     if (msg->packet_size < s->params->chunk_size) 
         num_chunks++;
 
+    /* Set channel injection delay (cn stands for compute node) */
+    double cn_delay = s->params->cn_delay;
     if(msg->packet_size < s->params->chunk_size)
         cn_delay = bytes_to_ns(msg->packet_size % s->params->chunk_size, s->params->cn_bandwidth);
 
@@ -3284,27 +3341,28 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
         if(injection_connections.size() < 1)
             tw_error(TW_LOC, "Packet Generation Failure: No non-failed injection connections available on terminal %d\n", s->terminal_id);
 
+        /* Prepare vector<Connection> valid_rails */
         vector< Connection > valid_rails;
         if (netMan.is_link_failures_enabled())
         {
             for (int i = 0; i < injection_connections.size(); i++)
             {
                 int rail_id = injection_connections[i].rail_or_planar_id;
-                int dest_router_id = dfdally_get_assigned_router_id_from_terminal(s->params, msg->dfdally_dest_terminal_id, rail_id);
+                int tmp_dest_router_id = dfdally_get_assigned_router_id_from_terminal(s->params, msg->dfdally_dest_terminal_id, rail_id);
                 int src_router_id = dfdally_get_assigned_router_id_from_terminal(s->params, s->terminal_id, rail_id);
                 int src_group_id = src_router_id / s->params->num_routers;
-                int dest_group_id = dest_router_id / s->params->num_routers;
+                int dest_group_id = tmp_dest_router_id / s->params->num_routers;
 
                 if (isRoutingMinimal(routing)) {
                     if (src_group_id == dest_group_id)
                     {
-                        set<Connection> valid_next_stops = netMan.get_valid_next_hops_conns(src_router_id, dest_router_id, max_hops_per_group,0); //max global hops for local group routing == 0
+                        set<Connection> valid_next_stops = netMan.get_valid_next_hops_conns(src_router_id, tmp_dest_router_id, max_hops_per_group, 0); //max global hops for local group routing == 0
                         if (valid_next_stops.size() > 0)
                             valid_rails.push_back(injection_connections[i]);
                     }
                     else
                     {
-                        set<Connection> valid_next_stops = netMan.get_valid_next_hops_conns(src_router_id, dest_router_id, max_hops_per_group,1); //max global hops for local group routing == 0
+                        set<Connection> valid_next_stops = netMan.get_valid_next_hops_conns(src_router_id, tmp_dest_router_id, max_hops_per_group, 1); //max global hops for local group routing == 0
                         if (valid_next_stops.size() > 0)
                             valid_rails.push_back(injection_connections[i]);
                     }
@@ -3319,7 +3377,7 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
                     // }
                     // else
                     // {
-                        set<Connection> valid_next_stops = netMan.get_valid_next_hops_conns(src_router_id, dest_router_id, max_hops_per_group,max_global_hops_nonminimal); //max global hops for local group routing == 0
+                        set<Connection> valid_next_stops = netMan.get_valid_next_hops_conns(src_router_id, tmp_dest_router_id, max_hops_per_group, max_global_hops_nonminimal); //max global hops for local group routing == 0
                         if (valid_next_stops.size() > 0)
                             valid_rails.push_back(injection_connections[i]);
                     // }
@@ -3336,7 +3394,7 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
         
         vector< Connection > tied_rails;
 
-        //determine rail
+        /* determine rail: update msg->rail_id, and others ... */
         Connection target_rail_connection = valid_rails[0];
         if (valid_rails.size() > 1)
         {
@@ -3364,10 +3422,10 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
                 for(; it != valid_rails.end(); it++)
                 {
                     int rail_id = it->rail_or_planar_id;
-                    int dest_router_id = dfdally_get_assigned_router_id_from_terminal(s->params, msg->dfdally_dest_terminal_id, rail_id);
+                    int tmp_dest_router_id = dfdally_get_assigned_router_id_from_terminal(s->params, msg->dfdally_dest_terminal_id, rail_id);
                     int src_router_id = dfdally_get_assigned_router_id_from_terminal(s->params, s->terminal_id, rail_id);
 
-                    path_lens[index] = netMan.get_shortest_dist_between_routers(src_router_id, dest_router_id);
+                    path_lens[index] = netMan.get_shortest_dist_between_routers(src_router_id, tmp_dest_router_id);
                     if (path_lens[index] < min_len) {
                         min_len = path_lens[index];
                         target_rail_connection = *it;
@@ -3440,6 +3498,7 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
     int dest_grp_id = dest_router_id / s->params->num_routers;
     int src_grp_id = s->router_id[msg->rail_id] / s->params->num_routers; 
 
+    /* handle whether the source and destination are in the same group */
     if(src_grp_id == dest_grp_id)
     {
         if(dest_router_id == s->router_id[msg->rail_id])
@@ -3458,7 +3517,8 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
         bf->c4 = 1;
         num_remote_packets++;
     }
-    
+
+    /* Update `msg` and `s` */
     msg->packet_ID = s->packet_counter;
     s->packet_counter++;
     msg->my_N_hop = 0;
@@ -3486,12 +3546,13 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
             s->is_monitoring_bw = 1;
             tw_event_send(e);
         }
-        vcg = get_vcg_from_category(msg);
+        vcg = get_vcg_from_category(msg); 
         assert(vcg == Q_HIGH || vcg == Q_MEDIUM);
     }
     assert(vcg < num_qos_levels);
 
 
+    /* Split a packet into chunks, and put them into the message list (s->terminal_msgs)  */
     for(int i = 0; i < num_chunks; i++)
     {
         terminal_dally_message_list *cur_chunk = (terminal_dally_message_list*)calloc(1,
@@ -3500,8 +3561,7 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
         init_terminal_dally_message_list(cur_chunk, msg);
     
         if(msg->remote_event_size_bytes + msg->local_event_size_bytes > 0) {
-        cur_chunk->event_data = (char*)calloc(1,
-            msg->remote_event_size_bytes + msg->local_event_size_bytes);
+            cur_chunk->event_data = (char*)calloc(1, msg->remote_event_size_bytes + msg->local_event_size_bytes);
         }
         
         void * m_data_src = model_net_method_get_edata(DRAGONFLY_DALLY, msg);
@@ -3518,11 +3578,13 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
         cur_chunk->msg.output_chan = vcg;
         cur_chunk->msg.chunk_id = i;
         cur_chunk->msg.origin_router_id = s->router_id[msg->rail_id];
-        append_to_terminal_dally_message_list(s->terminal_msgs[msg->rail_id], s->terminal_msgs_tail[msg->rail_id],
-        vcg, cur_chunk);
+        /* append each chunk into the message list of the terminal*/
+        append_to_terminal_dally_message_list(
+                s->terminal_msgs[msg->rail_id], s->terminal_msgs_tail[msg->rail_id], vcg, cur_chunk);
         s->terminal_length[msg->rail_id][vcg] += s->params->chunk_size;
     }
-    
+
+    /* Set the delay of NIC (nic_ts) */
     double bandwidth_coef = 1;
     if (g_congestion_control_enabled) {
         if (cc_terminal_is_abatement_active(s->local_congestion_controller)) {
@@ -3536,7 +3598,7 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
     nic_ts = injection_ts;
 
 
-
+    /* If there are multiple injection queues ... */
     if (s->params->num_injection_queues > 1) {
         tw_stime *bts = buff_time_storage_create(s); //mallocs space to push onto the rc stack -- free'd in rc
         int *iis = int_storage_create(s);
@@ -3594,13 +3656,16 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
     //         s->last_buf_full[msg->rail_id] = tw_now(lp);
     //     }
     // }
-    
+
+    /* If s->in_send_loop of the designated rail is empty (0),
+     * then issue a T_SEND event to myself,
+     * and update `s->in_send_loop` to be 1 */
+    // TODO: what if the send loop is not empty?????
     if(s->in_send_loop[msg->rail_id] == 0) {
         bf->c5 = 1;
         ts = 0;
         terminal_dally_message *m;
-        tw_event* e = model_net_method_event_new(lp->gid, ts + gen_noise(lp, &msg->num_rngs), lp, DRAGONFLY_DALLY, 
-        (void**)&m, NULL);
+        tw_event* e = model_net_method_event_new(lp->gid, ts + gen_noise(lp, &msg->num_rngs), lp, DRAGONFLY_DALLY, (void**)&m, NULL);
         m->rail_id = msg->rail_id;
         m->type = T_SEND;
         m->magic = terminal_magic_num;
@@ -3608,8 +3673,8 @@ static void packet_generate(terminal_state * s, tw_bf * bf, terminal_dally_messa
         tw_event_send(e);
     }
 
-    total_event_size = model_net_get_msg_sz(DRAGONFLY_DALLY) + 
-        msg->remote_event_size_bytes + msg->local_event_size_bytes;
+    /* Collect statistics */
+    total_event_size = model_net_get_msg_sz(DRAGONFLY_DALLY) + msg->remote_event_size_bytes + msg->local_event_size_bytes;
     mn_stats* stat;
     stat = model_net_find_stats(msg->category, s->dragonfly_stats_array);
     stat->send_count++;
@@ -3696,6 +3761,7 @@ static void packet_send(terminal_state * s, tw_bf * bf, terminal_dally_message *
     msg->qos_reset2 = -1;
     msg->saved_send_loop = s->in_send_loop[msg->rail_id];
 
+    /* Choose which chunk to send */
     vcg = get_next_vcg(s, bf, msg, lp);
     
     /* For a terminal to router connection, there would be as many VCGs as number
@@ -3733,14 +3799,15 @@ static void packet_send(terminal_state * s, tw_bf * bf, terminal_dally_message *
      * Propagtion delay: Time taken for the data to cross the link and arrive at the reciever
      *    - A physical property of the material of the link (eg. copper, optical fiber)
      */
-    tw_stime injection_ts, injection_delay;
-    tw_stime propagation_ts, propagation_delay;
+    tw_stime injection_ts, injection_delay;  // injection_ts: time span between now and when the injection finish
+    tw_stime propagation_ts, propagation_delay; // propagation_ts: time span between now and when the propagation finish
 
     double bandwidth = s->params->cn_bandwidth;
     if (g_congestion_control_enabled)
         bandwidth = bandwidth_coef * bandwidth;
- 
+
     injection_delay = bytes_to_ns(s->params->chunk_size, bandwidth);
+    /* If this is the last chunk of a packet and its size is less than the largest chunk size supported by the network */
     if((cur_entry->msg.packet_size < s->params->chunk_size) && (cur_entry->msg.chunk_id == num_chunks - 1))
     {
         data_size = cur_entry->msg.packet_size % s->params->chunk_size;
@@ -3749,7 +3816,7 @@ static void packet_send(terminal_state * s, tw_bf * bf, terminal_dally_message *
     propagation_delay = s->params->cn_delay;
 
     s->qos_data[msg->rail_id][vcg] += data_size;
-  
+
     // injection_delay += g_tw_lookahead;
     
     msg->saved_available_time = s->terminal_available_time[msg->rail_id];
@@ -3761,6 +3828,7 @@ static void packet_send(terminal_state * s, tw_bf * bf, terminal_dally_message *
 
     router_id = s->router_lp[msg->rail_id];
 
+    /* Issue a new R_ARRIVE event that will be sent to `router_id`*/
     void * remote_event;
     e = model_net_method_event_new(router_id, propagation_ts + gen_noise(lp, &msg->num_rngs), lp,
             DRAGONFLY_DALLY_ROUTER, (void**)&m, &remote_event);
@@ -3794,12 +3862,12 @@ static void packet_send(terminal_state * s, tw_bf * bf, terminal_dally_message *
         tw_stime local_ts = 0;
         tw_event *e_new = tw_event_new(cur_entry->msg.sender_lp, local_ts, lp);
         void * m_new = tw_event_data(e_new);
-        void *local_event = (char*)cur_entry->event_data + 
-        cur_entry->msg.remote_event_size_bytes;
+        void *local_event = (char*)cur_entry->event_data + cur_entry->msg.remote_event_size_bytes;
         memcpy(m_new, local_event, cur_entry->msg.local_event_size_bytes);
         tw_event_send(e_new);
     }
-    
+
+    /* Now the sending of the chunk is done, then pop the chunk out of the message list, and process what? */
     s->vc_occupancy[msg->rail_id][vcg] += s->params->chunk_size;
     cur_entry = return_head(s->terminal_msgs[msg->rail_id], s->terminal_msgs_tail[msg->rail_id], vcg); 
     rc_stack_push(lp, cur_entry, delete_terminal_dally_message_list, s->st);
@@ -3850,7 +3918,7 @@ static void packet_send(terminal_state * s, tw_bf * bf, terminal_dally_message *
             s->last_buf_full[msg->rail_id] = 0.0;
         }
     }
-    return;
+return;
 }
 
 //used by packet_arrive()
@@ -4241,7 +4309,7 @@ static void terminal_buf_update_rc(terminal_state * s,
 
     return;
 }
-/* update the compute node-router channel buffer */
+/* Handler of T_BUFFER event: update the compute node-router channel buffer */
 static void terminal_buf_update(terminal_state * s, 
 		    tw_bf * bf, 
 		    terminal_dally_message * msg, 
@@ -4260,6 +4328,7 @@ static void terminal_buf_update(terminal_state * s,
     tw_stime ts = 0;
     s->vc_occupancy[msg->rail_id][vcg] -= s->params->chunk_size;
     
+    // If no packet is being sent, and there IS a packet in the queue, then send it
     if(s->in_send_loop[msg->rail_id] == 0 && s->terminal_msgs[msg->rail_id][vcg] != NULL) {
         terminal_dally_message *m;
         bf->c1 = 1;
@@ -4456,28 +4525,6 @@ void dragonfly_dally_router_final(router_state * s, tw_lp * lp){
     if(g_congestion_control_enabled)
         cc_router_local_controller_finalize(s->local_congestion_controller);
 
-    /*if(!s->router_id)
-    {
-        written = sprintf(s->output_buf, "# Format <LP ID> <Group ID> <Router ID> <Link Traffic per router port(s)>");
-        written += sprintf(s->output_buf + written, "# Router ports in the order: %d green links, %d black links %d global channels \n", 
-                p->num_router_cols * p->num_row_chans, p->num_router_rows * p->num_col_chans, p->num_global_channels);
-    }
-    written += sprintf(s->output_buf2 + written, "\n %llu %d %d",
-        LLU(lp->gid),
-        s->router_id / p->num_routers,
-        s->router_id % p->num_routers);
-
-    for(int d = 0; d < p->radix; d++) 
-        written += sprintf(s->output_buf2 + written, " %lld", LLD(s->link_traffic[d]));
-
-    lp_io_write(lp->gid, (char*)"dragonfly-router-traffic", written, s->output_buf2);
-    */
-    // if (!g_tw_mynode) {
-    //     if (s->router_id == 0) {
-    //         if (PRINT_CONFIG) 
-    //             dragonfly_print_params(s->params);
-    //     }
-    // }
 }
 
 static Connection do_dfdally_routing(router_state *s, tw_bf *bf, terminal_dally_message *msg, tw_lp *lp, int fdest_router_id)
@@ -4742,7 +4789,7 @@ static void router_packet_receive( router_state * s,
 			terminal_dally_message * msg, 
 			tw_lp * lp )
 {
-    router_verify_valid_receipt(s, bf, msg, lp);
+    router_verify_valid_receipt(s, bf, msg, lp);  // TODO: Do we need this in production?
 
     tw_stime ts;
 
@@ -4846,32 +4893,6 @@ static void router_packet_receive( router_state * s,
         cur_chunk->msg.my_hops_cur_group = 0; //reset this as it's going to a new group
         cur_chunk->msg.my_g_hop++;
     }
-
-    //this seemed outdated with current literature and was replaced with the scheme above.
-    // output_chan = 0;
-    // if(output_port < s->params->intra_grp_radix) {
-    //     if(cur_chunk->msg.my_g_hop == 1 && cur_chunk->msg.last_hop == GLOBAL) {
-    //         output_chan = 1;
-    //     }
-    //     else if(cur_chunk->msg.my_g_hop == 1 && cur_chunk->msg.last_hop == LOCAL) {
-    //         output_chan = 2;
-    //     }
-    //     else if (cur_chunk->msg.my_g_hop == 2) {
-    //         output_chan = 3;
-    //     }
-
-    //     max_vc_size = s->params->local_vc_size;
-    //     cur_chunk->msg.my_l_hop++;
-    //     cur_chunk->msg.my_hops_cur_group++;
-    // }
-    // else if(output_port < (s->params->intra_grp_radix +
-    //     s->params->num_global_channels))
-    // {
-    //     output_chan = cur_chunk->msg.my_g_hop;
-    //     max_vc_size = s->params->global_vc_size;
-    //     cur_chunk->msg.my_hops_cur_group = 0; //reset this as it's going to a new group
-    //     cur_chunk->msg.my_g_hop++;
-    // }
         
     assert(output_chan < vcs_per_qos);
     output_chan = output_chan + (vcg * vcs_per_qos);
@@ -6205,7 +6226,7 @@ static int get_output_port_legacy(router_state *s, terminal_dally_message *msg, 
     int rand_offset = -1;
     int terminal_id = codes_mapping_get_lp_relative_id(msg->dest_terminal_lpid, 0, 0);
     const dragonfly_param *p = s->params;
-        
+
     int local_router_id = codes_mapping_get_lp_relative_id(next_stop, 0, 0);
     int src_router = s->router_id;
 
@@ -6241,7 +6262,7 @@ static int get_output_port_legacy(router_state *s, terminal_dally_message *msg, 
         else
         {
             vector< Connection > conns_to_local_router = s->connMan.get_connections_to_gid(local_router_id, CONN_LOCAL);
-            
+
             (*rng_counter)++;
             rand_offset = tw_rand_integer(lp->rng, 0, conns_to_local_router.size()-1);
 
@@ -6276,13 +6297,13 @@ static tw_lpid get_next_stop_legacy(router_state *s, tw_lp *lp, tw_bf *bf, termi
     if(s->group_id == dest_group_id)
     {
         int next_stop = dest_router_id; //trimmed down from old as the old had a lot of superflouous code to poll randomly from a vector of one.
-        
+
         codes_mapping_get_lp_id(lp_group_name, LP_CONFIG_NM_ROUT, s->anno, 0, next_stop / num_routers_per_mgrp,
             next_stop % num_routers_per_mgrp, &router_dest_id);
-    
+
         if(msg->packet_ID == LLU(TRACK_PKT) && msg->src_terminal_id == T_ID)
                 printf("\n Next stop is %d ", next_stop);
-        
+
         return router_dest_id;
     }
 
@@ -6291,7 +6312,7 @@ static tw_lpid get_next_stop_legacy(router_state *s, tw_lp *lp, tw_bf *bf, termi
         * adaptive routing). do_chan_selection is turned on in case prog-adaptive
         * routing has just decided to take a non-minimal route. */
     //modified a little to work with connection manager
-    if(msg->last_hop == TERMINAL 
+    if(msg->last_hop == TERMINAL
             || s->router_id == msg->intm_rtr_id
             || (routing == PROG_ADAPTIVE_LEGACY && do_chan_selection))
     {
@@ -6351,14 +6372,14 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
 {
     int next_chan = -1;
     // decide which routing to take
-    // get the queue occupancy of both the minimal and non-minimal output ports 
+    // get the queue occupancy of both the minimal and non-minimal output ports
 
     bool local_min = false;
     int num_routers = s->params->num_routers;
     int dest_grp_id = dest_router_id / num_routers;
     int intm_grp_id_a = intm_id_a / num_routers;
     int intm_grp_id_b = intm_id_b / num_routers;
-    
+
     assert(intm_grp_id_a >= 0 && intm_grp_id_b >=0);
 
     int my_grp_id = s->router_id / num_routers;
@@ -6409,7 +6430,7 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
             assert(min_chan_b >= 0);
             noIntraB = false;
             min_rtr_b = connectionList[my_grp_id][dest_grp_id][min_chan_b];
-        
+
             if(min_rtr_b == s->router_id) {
                 noIntraB = true;
                 min_rtr_b = s->connMan.get_connections_to_group(dest_grp_id)[0].dest_gid;
@@ -6424,7 +6445,7 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
         noIntraB = true;
 
         assert(direct_intra.size() > 0);
-        min_rtr_a = direct_intra[min_chan_a]; 
+        min_rtr_a = direct_intra[min_chan_a];
         dest_rtr_as.push_back(min_rtr_a);
 
         if(num_min_chans > 1)
@@ -6435,7 +6456,7 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
     int dest_rtr_a_sel = tw_rand_integer(lp->rng, 0, dest_rtr_as.size() - 1);
 
     codes_mapping_get_lp_id(lp_group_name, LP_CONFIG_NM_ROUT, s->anno, 0, dest_rtr_as[dest_rtr_a_sel] / num_routers_per_mgrp,
-            dest_rtr_as[dest_rtr_a_sel] % num_routers_per_mgrp, &min_rtr_a_id); 
+            dest_rtr_as[dest_rtr_a_sel] % num_routers_per_mgrp, &min_rtr_a_id);
 
     min_port_a = get_output_port_legacy(s, msg, lp, bf, min_rtr_a_id, rng_counter);
 
@@ -6446,7 +6467,7 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
         (*rng_counter)++;
         dest_rtr_b_sel = tw_rand_integer(lp->rng, 0, dest_rtr_bs.size() - 1);
         codes_mapping_get_lp_id(lp_group_name, LP_CONFIG_NM_ROUT, s->anno, 0, dest_rtr_bs[dest_rtr_b_sel] / num_routers_per_mgrp,
-            dest_rtr_bs[dest_rtr_b_sel] % num_routers_per_mgrp, &min_rtr_b_id); 
+            dest_rtr_bs[dest_rtr_b_sel] % num_routers_per_mgrp, &min_rtr_b_id);
         min_port_b = get_output_port_legacy(s, msg, lp, bf, min_rtr_b_id, rng_counter);
     }
 
@@ -6474,7 +6495,7 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
         assert(rand_a >= 0);
         nonmin_chan_a = rand_a;
         nonmin_rtr_a = connectionList[my_grp_id][intm_grp_id_a][rand_a];
-        if(nonmin_rtr_a == s->router_id) 
+        if(nonmin_rtr_a == s->router_id)
         {
             noIntraA = true;
             nonmin_rtr_a = s->connMan.get_connections_to_group(intm_grp_id_a)[0].dest_gid; //NOTE: This line did not exist in the original but I believe this was what was supposed to happen and it won't work without it, otherwise nonmin_rtr_* is THIS ROUTER
@@ -6482,7 +6503,7 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
 
     }
     assert(nonmin_chan_a >= 0);
-    
+
     if(num_nonmin_chans_b > 0) {
         noIntraB = false;
         if(nonmin_chan_b != -1) {
@@ -6509,9 +6530,9 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
 
     (*rng_counter)++;
     dest_rtr_a_sel = tw_rand_integer(lp->rng, 0, dest_rtr_as.size() - 1);
-  
+
     codes_mapping_get_lp_id(lp_group_name, LP_CONFIG_NM_ROUT, s->anno, 0, dest_rtr_as[dest_rtr_a_sel] / num_routers_per_mgrp,
-            dest_rtr_as[dest_rtr_a_sel] % num_routers_per_mgrp, &nonmin_rtr_a_id); 
+            dest_rtr_as[dest_rtr_a_sel] % num_routers_per_mgrp, &nonmin_rtr_a_id);
     nonmin_port_a = get_output_port_legacy(s, msg, lp, bf, nonmin_rtr_a_id, rng_counter);
 
     assert(nonmin_port_a >= 0);
@@ -6524,7 +6545,7 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
         (*rng_counter)++;
         dest_rtr_b_sel = tw_rand_integer(lp->rng, 0, dest_rtr_bs.size() - 1);
         codes_mapping_get_lp_id(lp_group_name, LP_CONFIG_NM_ROUT, s->anno, 0, dest_rtr_bs[dest_rtr_b_sel] / num_routers_per_mgrp,
-            dest_rtr_bs[dest_rtr_b_sel] % num_routers_per_mgrp, &nonmin_rtr_b_id); 
+            dest_rtr_bs[dest_rtr_b_sel] % num_routers_per_mgrp, &nonmin_rtr_b_id);
         nonmin_port_b = get_output_port_legacy(s, msg, lp, bf, nonmin_rtr_b_id, rng_counter);
         assert(nonmin_port_b >= 0);
     }
@@ -6533,12 +6554,12 @@ static int do_global_adaptive_routing_legacy(router_state *s, tw_lp *lp, termina
     int nonmin_port_a_count = 0, nonmin_port_b_count = 0;
 
     min_port_a_count = get_port_score_legacy(s, min_port_a, 0);
-    
+
     if(num_min_chans > 1)
     {
         min_port_b_count = get_port_score_legacy(s, min_port_b, 0);
     }
-    
+
     nonmin_port_a_count = get_port_score_legacy(s, nonmin_port_a, 1);
 
     if(num_nonmin_chans_b > 0)
@@ -6657,7 +6678,7 @@ static Connection dfdally_prog_adaptive_legacy_routing(router_state *s, tw_bf *b
                 intm_rtr_a = (intm_rtr_a + num_routers) % total_routers;
             if ((intm_rtr_b/num_routers) == my_group_id)
                 intm_rtr_b = (intm_rtr_b + num_routers) % total_routers;
-            
+
             assert(intm_rtr_a / num_routers != my_group_id);
             assert(intm_rtr_b / num_routers != my_group_id);
         }
@@ -6665,27 +6686,27 @@ static Connection dfdally_prog_adaptive_legacy_routing(router_state *s, tw_bf *b
     else
     {
         msg->num_rngs++;
-        intm_rtr_a = (src_grp_id * num_routers) + 
-                        (((s->router_id % num_routers) + 
+        intm_rtr_a = (src_grp_id * num_routers) +
+                        (((s->router_id % num_routers) +
                         tw_rand_integer(lp->rng, 1, num_routers - 1)) % num_routers);
     }
-    
+
     if(routing == NON_MINIMAL)
         msg->path_type = NON_MINIMAL;
-    
+
     /* progressive adaptive routing is only triggered when packet has to traverse a
     * global channel. It doesn't make sense to use it within a group */
-    if(dest_grp_id != src_grp_id && 
-            ((msg->last_hop == TERMINAL 
-                && routing == ADAPTIVE) 
-            || (msg->path_type == MINIMAL 
+    if(dest_grp_id != src_grp_id &&
+            ((msg->last_hop == TERMINAL
+                && routing == ADAPTIVE)
+            || (msg->path_type == MINIMAL
                 && routing == PROG_ADAPTIVE_LEGACY
              // && s->router_id != dest_router_id)))
-                && my_group_id == src_grp_id))) 
+                && my_group_id == src_grp_id)))
     {
         adap_chan = do_global_adaptive_routing_legacy(s, lp, msg, bf, dest_router_id, intm_rtr_a, intm_rtr_b, &(msg->num_rngs));
     }
-    
+
     /* If destination router is in the same group then local adaptive routing is
     * triggered */
     if(msg->origin_router_id == dest_router_id)
@@ -6693,8 +6714,8 @@ static Connection dfdally_prog_adaptive_legacy_routing(router_state *s, tw_bf *b
 
     if(dest_grp_id == src_grp_id &&
             dest_router_id != s->router_id &&
-            (routing == ADAPTIVE || routing == PROG_ADAPTIVE_LEGACY) 
-            && msg->last_hop == TERMINAL) 
+            (routing == ADAPTIVE || routing == PROG_ADAPTIVE_LEGACY)
+            && msg->last_hop == TERMINAL)
     {
             do_local_adaptive_routing_legacy(s, lp, msg, bf, dest_router_id, intm_rtr_a, &(msg->num_rngs));
     }
@@ -6705,9 +6726,9 @@ static Connection dfdally_prog_adaptive_legacy_routing(router_state *s, tw_bf *b
         tw_error(TW_LOC, "\n packet src %d dest %d intm %d src grp %d dest grp %d", s->router_id, dest_router_id, intm_rtr_a, src_grp_id, dest_grp_id);
 
     assert(msg->path_type == MINIMAL || msg->path_type == NON_MINIMAL);
-    
+
     /* If non-minimal, set the random destination */
-    if(msg->last_hop == TERMINAL 
+    if(msg->last_hop == TERMINAL
             && msg->path_type == NON_MINIMAL
             && msg->intm_rtr_id == -1)
     {
@@ -6736,19 +6757,19 @@ static Connection dfdally_prog_adaptive_legacy_routing(router_state *s, tw_bf *b
     || (msg->my_l_hop == max_lvc_intm_g && msg->my_g_hop == min_gvc_intm_g))
         get_direct_con = 1;
     }
-    
+
     /* If the packet route has just changed to non-minimal with prog-adaptive
     * routing, we have to compute the next stop based on that */
     int do_chan_selection = 0;
     if(routing == PROG_ADAPTIVE_LEGACY && prev_path_type != next_path_type && s->group_id == src_grp_id)
         do_chan_selection = 1;
-  
+
     next_stop = get_next_stop_legacy(s, lp, bf, msg, dest_router_id, adap_chan, do_chan_selection, get_direct_con, &(msg->num_rngs));
 
     if(msg->packet_ID == LLU(TRACK_PKT) && msg->src_terminal_id == T_ID)
         printf("\n Packet %llu arrived at router %u next stop %d final stop %d local hops %d global hops %d", msg->packet_ID, s->router_id, next_stop, dest_router_id, msg->my_l_hop, msg->my_g_hop);
 
-    output_port = get_output_port_legacy(s, msg, lp, bf, next_stop, &(msg->num_rngs)); 
+    output_port = get_output_port_legacy(s, msg, lp, bf, next_stop, &(msg->num_rngs));
     assert(output_port >= 0);
 
     Connection return_conn = s->connMan.get_connection_on_port(output_port);
@@ -6812,306 +6833,6 @@ struct model_net_method dragonfly_dally_router_method =
     (commit_f)dragonfly_dally_router_congestion_event_commit,
 };
 
-// #ifdef ENABLE_CORTEX
-
-// static int dragonfly_dally_get_number_of_compute_nodes(void* topo) {
-    
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1.0;
-
-//     return params->total_terminals;
-// }
-
-// static int dragonfly_dally_get_number_of_routers(void* topo) {
-//     // TODO
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1.0;
-
-//     return params->total_routers;
-// }
-
-// static double dragonfly_dally_get_router_link_bandwidth(void* topo, router_id_t r1, router_id_t r2) {
-//         // TODO: handle this function for multiple cables between the routers.
-//         // Right now it returns the bandwidth of a single cable only. 
-// 	// Given two router ids r1 and r2, this function should return the bandwidth (double)
-// 	// of the link between the two routers, or 0 of such a link does not exist in the topology.
-// 	// The function should return -1 if one of the router id is invalid.
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1.0;
-
-//     if(r1 > params->total_routers || r2 > params->total_routers)
-//         return -1.0;
-
-//     if(r1 < 0 || r2 < 0)
-//         return -1.0;
-
-//     int gid_r1 = r1 / params->num_routers;
-//     int gid_r2 = r2 / params->num_routers;
-
-//     if(gid_r1 == gid_r2)
-//     {
-//         int lid_r1 = r1 % params->num_routers;
-//         int lid_r2 = r2 % params->num_routers;
-
-//         /* The connection will be there if the router is in the same row or
-//          * same column */
-//         int src_row_r1 = lid_r1 / params->num_router_cols;
-//         int src_row_r2 = lid_r2 / params->num_router_cols;
-
-//         int src_col_r1 = lid_r1 % params->num_router_cols;
-//         int src_col_r2 = lid_r2 % params->num_router_cols;
-
-//         if(src_row_r1 == src_row_r2 || src_col_r1 == src_col_r2)
-//             return params->local_bandwidth;
-//         else
-//             return 0.0;
-//     }
-//     else
-//     {
-//         vector<bLink> &curVec = interGroupLinks[r1][gid_r2];
-//         vector<bLink>::iterator it = curVec.begin();
-
-//         for(; it != curVec.end(); it++)
-//         {
-//             bLink bl = *it;
-//             if(bl.dest == r2)
-//                 return params->global_bandwidth;
-//         }
-        
-//         return 0.0;
-//     }
-//     return 0.0;
-// }
-
-// static double dragonfly_dally_get_compute_node_bandwidth(void* topo, cn_id_t node) {
-//         // TODO
-// 	// Given the id of a compute node, this function should return the bandwidth of the
-// 	// link connecting this compute node to its router.
-// 	// The function should return -1 if the compute node id is invalid.
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1.0;
-   
-//     if(node < 0 || node >= params->total_terminals)
-//         return -1.0;
-    
-//     return params->cn_bandwidth;
-// }
-
-// static int dragonfly_dally_get_router_neighbor_count(void* topo, router_id_t r) {
-//         // TODO
-// 	// Given the id of a router, this function should return the number of routers
-// 	// (not compute nodes) connected to it. It should return -1 if the router id
-// 	// is not valid.
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1.0;
-
-//     if(r < 0 || r >= params->total_routers)
-//         return -1.0;
-
-//     /* Now count the global channels */
-//     set<router_id_t> g_neighbors;
-
-//     map< int, vector<bLink> > &curMap = interGroupLinks[r];
-//     map< int, vector<bLink> >::iterator it = curMap.begin(); 
-//     for(; it != curMap.end(); it++) {   
-//         for(int l = 0; l < it->second.size(); l++) {
-//             g_neighbors.insert(it->second[l].dest);
-//         }
-//     }
-//     return (params->num_router_cols - 1) + (params->num_router_rows - 1) + g_neighbors.size();
-// }
-
-// static void dragonfly_dally_get_router_neighbor_list(void* topo, router_id_t r, router_id_t* neighbors) {
-// 	// Given a router id r, this function fills the "neighbors" array with the ids of routers
-// 	// directly connected to r. It is assumed that enough memory has been allocated to "neighbors"
-// 	// (using get_router_neighbor_count to know the required size).
-//     const dragonfly_param * params = &all_params[num_params-1];
-
-//     int gid = r / params->num_routers;
-//     int local_rid = r - (gid * params->num_routers);
-//     int src_row = local_rid / params->num_router_cols;
-//     int src_col = local_rid % params->num_router_cols;
-
-//     /* First the routers in the same row */
-//     int i = 0;
-//     int offset = 0;
-//     while(i < params->num_router_cols)
-//     {
-//         int neighbor = gid * params->num_routers + (src_row * params->num_router_cols) + i;
-//         if(neighbor != r)
-//         {
-//             neighbors[offset] = neighbor;
-//             offset++;
-//         }
-//         i++;
-//     }
-
-//     /* Now the routers in the same column. */
-//     offset = 0;
-//     i = 0;
-//     while(i <  params->num_router_rows)
-//     {
-//         int neighbor = gid * params->num_routers + src_col + (i * params->num_router_cols);
-
-//         if(neighbor != r)
-//         {
-//             neighbors[offset+params->num_router_cols-1] = neighbor;
-//             offset++;
-//         }
-//         i++;
-//     }
-//     int g_offset = params->num_router_cols + params->num_router_rows - 2;
-    
-//     /* Now fill up global channels */
-//     set<router_id_t> g_neighbors;
-
-//     map< int, vector<bLink> > &curMap = interGroupLinks[r];
-//     map< int, vector<bLink> >::iterator it = curMap.begin(); 
-//     for(; it != curMap.end(); it++) {   
-//         for(int l = 0; l < it->second.size(); l++) {
-//             g_neighbors.insert(it->second[l].dest);
-//         }
-//     }
-//     /* Now transfer the content of the sets to the array */
-//     set<router_id_t>::iterator it_set;
-//     int count = 0;
-
-//     for(it_set = g_neighbors.begin(); it_set != g_neighbors.end(); it_set++)
-//     {
-//         neighbors[g_offset+count] = *it_set;
-//         ++count;
-//     }
-// }
-
-// static int dragonfly_dally_get_router_location(void* topo, router_id_t r, int32_t* location, int size) {
-//         // TODO
-// 	// Given a router id r, this function should fill the "location" array (of maximum size "size")
-// 	// with information providing the location of the router in the topology. In a Dragonfly network,
-// 	// for instance, this can be the array [ group_id, router_id ] where group_id is the id of the
-// 	// group in which the router is, and router_id is the id of the router inside this group (as opposed
-// 	// to "r" which is its global id). For a torus network, this would be the dimensions.
-// 	// If the "size" is sufficient to hold the information, the function should return the size 
-// 	// effectively used (e.g. 2 in the above example). If however the function did not manage to use
-// 	// the provided buffer, it should return -1.
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1;
-
-//     if(r < 0 || r >= params->total_terminals)
-//         return -1;
-
-//     if(size < 2)
-//         return -1;
-
-//     int rid = r % params->num_routers;
-//     int gid = r / params->num_routers;
-//     location[0] = gid;
-//     location[1] = rid;
-//     return 2;
-// }
-
-// static int dragonfly_dally_get_compute_node_location(void* topo, cn_id_t node, int32_t* location, int size) {
-//         // TODO
-// 	// This function does the same as dragonfly_dally_get_router_location but for a compute node instead
-// 	// of a router. E.g., for a dragonfly network, the location could be expressed as the array
-// 	// [ group_id, router_id, terminal_id ]
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1;
-
-//     if(node < 0 || node >= params->total_terminals)
-//         return -1;
-  
-//     if(size < 3)
-//         return -1;
-
-//     int rid = (node / params->num_cn) % params->num_routers;
-//     int rid_global = node / params->num_cn;
-//     int gid = rid_global / params->num_routers;
-//     int lid = node % params->num_cn;
-   
-//     location[0] = gid;
-//     location[1] = rid;
-//     location[2] = lid;
-
-//     return 3;
-// }
-
-// static router_id_t dragonfly_dally_get_router_from_compute_node(void* topo, cn_id_t node) {
-//         // TODO
-// 	// Given a node id, this function returns the id of the router connected to the node,
-// 	// or -1 if the node id is not valid.
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1;
-
-//     if(node < 0 || node >= params->total_terminals)
-//         return -1;
-    
-//     router_id_t rid = node / params->num_cn;
-//     return rid;
-// }
-
-// static int dragonfly_dally_get_router_compute_node_count(void* topo, router_id_t r) {
-// 	// Given the id of a router, returns the number of compute nodes connected to this
-// 	// router, or -1 if the router id is not valid.
-//     const dragonfly_param * params = &all_params[num_params-1];
-//     if(!params)
-//         return -1;
-
-//     if(r < 0 || r >= params->total_routers)
-//         return -1;
-    
-//     return params->num_cn;
-// }
-
-// static void dragonfly_dally_get_router_compute_node_list(void* topo, router_id_t r, cn_id_t* nodes) {
-//         // TODO: What if there is an invalid router ID?
-// 	// Given the id of a router, fills the "nodes" array with the list of ids of compute nodes
-// 	// connected to this router. It is assumed that enough memory has been allocated for the
-// 	// "nodes" variable to hold all the ids.
-//     const dragonfly_param * params = &all_params[num_params-1];
-
-//     for(int i = 0; i < params->num_cn; i++)
-//         nodes[i] = r * params->num_cn + i;
-// }
-
-// extern "C" {
-
-// cortex_topology dragonfly_dally_cortex_topology = {
-// //        .internal = 
-// 			NULL,
-// //		  .get_number_of_routers          = 
-// 			dragonfly_dally_get_number_of_routers,
-// //		  .get_number_of_compute_nodes	  = 
-// 			dragonfly_dally_get_number_of_compute_nodes,
-// //        .get_router_link_bandwidth      = 
-// 			dragonfly_dally_get_router_link_bandwidth,
-// //        .get_compute_node_bandwidth     = 
-// 			dragonfly_dally_get_compute_node_bandwidth,
-// //        .get_router_neighbor_count      = 
-// 			dragonfly_dally_get_router_neighbor_count,
-// //        .get_router_neighbor_list       = 
-// 			dragonfly_dally_get_router_neighbor_list,
-// //        .get_router_location            = 
-// 			dragonfly_dally_get_router_location,
-// //        .get_compute_node_location      = 
-// 			dragonfly_dally_get_compute_node_location,
-// //        .get_router_from_compute_node   = 
-// 			dragonfly_dally_get_router_from_compute_node,
-// //        .get_router_compute_node_count  = 
-// 			dragonfly_dally_get_router_compute_node_count,
-// //        .get_router_compute_node_list   = dragonfly_dally_get_router_compute_node_list,
-//             dragonfly_dally_get_router_compute_node_list
-// };
-
-// }
-// #endif
 
 }
 
