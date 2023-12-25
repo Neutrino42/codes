@@ -8,8 +8,8 @@ count=0
 CODES_LOC="/Users/Nann/workspace/codes-dev/codes"
 CODES_BUILD_LOC="$CODES_LOC/build"
 
-BIN="$CODES_BUILD_LOC/tests/modelnet-simplep2p-test"
-CONFIG="$CODES_LOC/tests/conf/modelnet-test-simplep2p.conf"
+BIN="$CODES_BUILD_LOC/src/network-workloads/modelnet-simplep2p-test"
+CONFIG="$CODES_LOC/src/network-workloads/conf/simplep2p/modelnet-test-simplep2p.conf"
 
 RANKS=3
 
