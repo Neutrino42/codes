@@ -246,6 +246,7 @@ int configuration_get_annotation_index(const char *              anno,
                                        const config_anno_map_t * anno_map);
 
 /*
+ * In configuration.h
  * Forward reference to the configuration handle
  */
 extern ConfigHandle config;
